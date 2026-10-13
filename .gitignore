@@ -1,0 +1,6 @@
+# build output
+/threads_per_value
+/threads_per_value_hip
+# Python environment for the plot
+/.venv/
+__pycache__/

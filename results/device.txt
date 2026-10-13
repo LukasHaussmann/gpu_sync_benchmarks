@@ -1,0 +1,2 @@
+NVIDIA RTX 4000 Ada Generation
+warp_size=32
