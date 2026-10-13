@@ -1,6 +1,8 @@
 # build output
 /threads_per_value
 /threads_per_value_hip
+/threads_per_value_metal
+/threads_per_value.metallib
 # Python environment for the plot
 /.venv/
 __pycache__/

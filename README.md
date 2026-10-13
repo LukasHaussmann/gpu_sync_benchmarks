@@ -3,7 +3,8 @@
 A self-contained GPU microbenchmark: how expensive is aggregating `uint32`
 values when k threads share each value, from k = 1 (one value per thread) to
 k = all threads (one value)? One source file builds for NVIDIA GPUs (CUDA) and
-AMD GPUs (HIP), so both run exactly the same benchmark.
+AMD GPUs (HIP), so both run exactly the same benchmark. A port for Apple GPUs
+(Metal, via metal-cpp) runs the same benchmark too; see "Apple (Metal)" below.
 
 ```bash
 make venv       # once: Python venv with matplotlib for the plot
@@ -17,7 +18,15 @@ make run        # benchmark (~3 min on an RTX 4000 Ada) + plot -> results/
 make hip        # build ./threads_per_value_hip
 make test-hip   # exact check, as above
 make run-hip    # benchmark + plot -> results_hip/
+
+# Apple silicon (Xcode command line tools with the Metal toolchain, metal-cpp)
+make metal      # build ./threads_per_value_metal + threads_per_value.metallib
+make test-metal # exact check, as above
+make run-metal  # benchmark + plot -> results_metal/
 ```
+
+The Metal build takes the metal-cpp headers from `~/lingodb-gpu/metal-cpp`;
+override with `make metal METAL_CPP=/path/to/metal-cpp`.
 
 The build targets the GPU in the machine; override with `make ARCH=sm_86` or
 `make hip HIP_ARCH=gfx90a`.
@@ -71,11 +80,13 @@ The build targets the GPU in the machine; override with `make ARCH=sm_86` or
 ## Options
 
 ```
-./threads_per_value [--out DIR] [--reps R] [--min-ops N] [--test]     (same for threads_per_value_hip)
-  --out DIR     output directory (default: results)
-  --reps R      timed runs per point, median reported (default: 5)
-  --min-ops N   fewest ops per thread in a run (default: 32)
-  --test        run the exact correctness checks instead of the benchmark
+./threads_per_value [--out DIR] [--reps R] [--min-ops N] [--max-run-s S] [--test]     (same for threads_per_value_hip)
+  --out DIR        output directory (default: results)
+  --reps R         timed runs per point, median reported (default: 5)
+  --min-ops N      fewest ops per thread in a run (default: 32)
+  --max-run-s S    skip points whose single run is projected to take longer
+                   (default: 10 on AMD, off on NVIDIA)
+  --test           run the exact correctness checks instead of the benchmark
 ```
 
 Each point calibrates its ops per thread so that one run takes at least 50 ms,
@@ -87,6 +98,15 @@ spinlock points with very few values can take minutes, because every thread does
 at least 32 lock rounds on the same few locks. `--min-ops 4` shortens those
 points about 8×; fewer than ~4 ops per thread measure mostly the start-up rush
 for the lock.
+
+So that such points cannot stall a run, the HIP build skips every point whose
+first run is projected to take more than `--max-run-s` seconds (default 10),
+printing it as `SKIPPED`. The projection scales the previous k's time per op by
+the growth in k (the k threads of a value take turns on its lock); it is rough
+and tends to come in somewhat low. Skipped points have no CSV row and are missing
+from the plot. Only spinlocks in global memory with many threads per value get
+there. The CUDA build skips nothing unless `--max-run-s` is given, and the Metal
+build uses the same rule (see below).
 
 ## NVIDIA vs. AMD: what differs in the code
 
@@ -119,3 +139,43 @@ The HIP build has been compiled for gfx90a (MI200), gfx942 (MI300) and gfx1100
 instructions: `ds_add_u32` / `global_atomic_add` for the atomics,
 `ds_wrxchg_rtn_b32` / `global_atomic_swap` for the lock. It has not yet been
 run on an AMD GPU: run `make test-hip` first there.
+
+## Apple (Metal)
+
+`threads_per_value.metal` (kernels, MSL 4.1) and `threads_per_value_metal.cpp`
+(host, metal-cpp) port the benchmark to Apple GPUs. The op streams, layouts,
+mechanisms, scopes, timing, verification, CSV and plot are the same as in
+`threads_per_value.cu`; the device code mirrors it one to one. What differs:
+
+- **Scoped atomics:** MSL 4.1 atomics carry their scope in the type,
+  `atomic<uint, thread_scope_threadgroup>` / `atomic<uint, thread_scope_device>`,
+  all relaxed (`atomic_fetch_add_explicit`, `atomic_exchange_explicit`). Fences
+  are `atomic_thread_fence(mem_flags, memory_order_seq_cst, scope)` over the
+  memory the table lives in (`mem_threadgroup` or `mem_device`).
+- **Spinlock loop:** Apple GPUs run the 32 lanes of a SIMD-group in lock-step,
+  as AMD wavefronts do, so the lock is the same try-lock loop as the HIP build.
+  The critical section reads and writes the value as a relaxed scoped atomic
+  (the CUDA build uses a `volatile` access).
+- **Grid size:** Metal has no occupancy query. A probe kernel (1,024-thread
+  blocks, 8 KB of threadgroup memory as the largest variant) counts how many
+  blocks are resident at once, and the benchmark launches that many: on an
+  M3 Ultra, 240 blocks (80 cores × 3) = 245,760 threads. `--blocks B` overrides
+  it. The core count comes from the IORegistry and is only printed.
+- **Timing:** command buffer `GPUStartTime` / `GPUEndTime` around one dispatch;
+  the table is reset by a blit in its own command buffer beforehand (untimed).
+- **Skipped points:** spinlocks at device scope (global memory, k > 1,024) are
+  very slow on Apple GPUs: a lock hand-off between threads of different cores
+  costs 15–120 µs, growing with the number of contenders (the fences are not the
+  cause; dropping them makes it slower). One run at k = all threads would take
+  over ten minutes. So every point whose first run is projected to take more than
+  `--max-run-s` (default 10 s) is skipped and printed as `SKIPPED`; the projection
+  scales the previous k's time per op by the growth in k. Skipped points have no
+  CSV row and are missing from the plot. Raise `--max-run-s` (or lower
+  `--min-ops`) to measure more of them.
+
+```
+./threads_per_value_metal [--out DIR] [--reps R] [--min-ops N] [--blocks B] [--max-run-s S] [--test]
+  --out DIR        output directory (default: results_metal)
+  --blocks B       blocks of 1,024 threads (default: as many as are resident at once)
+  --max-run-s S    skip points whose single run is projected to take longer (default: 10)
+```

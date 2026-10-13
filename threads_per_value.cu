@@ -453,14 +453,23 @@ int main(int argc, char** argv) {
     std::string out_dir = "results";
     TimingConfig timing;
     timing.reps = 5;
+    // Skip points whose single run would take longer (seconds). Off by default on
+    // NVIDIA; on AMD, device-scope spinlocks with many sharers on GPUs with many
+    // threads (e.g. ~600K on an MI300X) can take many minutes per run.
+#if defined(__HIP_PLATFORM_AMD__)
+    double max_run_s = 10;
+#else
+    double max_run_s = INFINITY;
+#endif
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--test") test = true;
         else if (a == "--out" && i + 1 < argc) out_dir = argv[++i];
         else if (a == "--reps" && i + 1 < argc) timing.reps = std::max(1, std::stoi(argv[++i]));
         else if (a == "--min-ops" && i + 1 < argc) timing.min_ops = std::max(1, std::stoi(argv[++i]));
+        else if (a == "--max-run-s" && i + 1 < argc) max_run_s = std::stod(argv[++i]);
         else {
-            std::printf("Usage: %s [--out DIR] [--reps R] [--min-ops N] [--test]\n", argv[0]);
+            std::printf("Usage: %s [--out DIR] [--reps R] [--min-ops N] [--max-run-s S] [--test]\n", argv[0]);
             return a == "--help" || a == "-h" ? EXIT_SUCCESS : EXIT_FAILURE;
         }
     }
@@ -518,19 +527,34 @@ int main(int argc, char** argv) {
     }
 
     const uint32_t seed = 42;
-    int checks = 0, failures = 0;
+    int checks = 0, failures = 0, skipped = 0;
     Timer timer;
     for (const Variant& v : variants()) {
+        // Skip points whose first run would take longer than max_run_s: projected
+        // from the previous k of this variant, with run time per op growing like k
+        // (the k threads of a value take turns). Only device-scope spinlocks with
+        // many sharers get there.
+        uint32_t prev_k = 0;
+        double prev_ms_per_op = 0;
         for (uint32_t k : threads_per_value(threads)) {
             if (v.memory == "shared" && k > (uint32_t)kBlock) continue;  // shared memory is per block
             const uint32_t values = threads / k;
+            const uint32_t first_ops = test ? 7 : timing.min_ops;
+            const double projected_s = prev_k ? prev_ms_per_op * k / prev_k * first_ops * 1e-3 : 0;
+            if (projected_s > max_run_s) {
+                ++skipped;
+                std::printf("%-6s %-9s %-6s %6u threads/value  SKIPPED: one run projected to take %.0f s (--max-run-s %.0f)\n",
+                            v.mechanism.c_str(), v.mapping.c_str(), v.memory.c_str(), k, projected_s, max_run_s);
+                std::fflush(stdout);
+                continue;
+            }
+            prev_k = k;
             const std::vector<uint32_t> assign = random_assignment(k, threads, seed);  // used by "random" only
             CUDA_CHECK(cudaMemcpy(d_assign, assign.data(), threads * sizeof(uint32_t), cudaMemcpyHostToDevice));
             if (test) {  // exact, value by value; every lock released
                 for (uint32_t ops : {1u, 7u}) {
                     CUDA_CHECK(cudaMemset(table, 0, table_bytes));
-                    v.launch(grid, table, k, d_assign, ops, seed);
-                    CUDA_CHECK(cudaGetLastError());
+                    prev_ms_per_op = timer.time_ms([&] { v.launch(grid, table, k, d_assign, ops, seed); }) / ops;
                     std::vector<uint32_t> words(threads * v.words_per_elem);
                     CUDA_CHECK(cudaMemcpy(words.data(), table, words.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
                     const std::vector<uint32_t> want = expected_values(v, grid, k, assign.data(), ops, seed);
@@ -544,6 +568,7 @@ int main(int argc, char** argv) {
                         ++failures;
                         std::printf("  FAIL %s %s %s k=%u ops=%u\n", v.mechanism.c_str(), v.mapping.c_str(),
                                     v.memory.c_str(), k, ops);
+                        std::fflush(stdout);
                     }
                 }
                 continue;
@@ -556,6 +581,7 @@ int main(int argc, char** argv) {
             std::vector<float> times;
             calibrate_and_time(timing, run_once, ops, times);
             const float ms = median(times);
+            prev_ms_per_op = ms / ops;
             const bool ok = table_total(v) == expected_total(ops, seed);
             if (!ok) ++failures;
             const double mops = threads * (double)ops / (ms * 1e-3) / 1e6;
@@ -570,10 +596,12 @@ int main(int argc, char** argv) {
     }
 
     if (test) {
-        std::printf("%d checks, %d failures. %s\n", checks, failures, failures ? "TESTS FAILED." : "All tests passed.");
+        std::printf("%d checks, %d failures, %d points skipped. %s\n", checks, failures, skipped,
+                    failures ? "TESTS FAILED." : "All tests passed.");
     } else {
         std::fclose(csv);
-        std::printf("Wrote %s/threads_per_value.csv%s\n", out_dir.c_str(), failures ? " (WITH FAILURES)" : "");
+        std::printf("Wrote %s/threads_per_value.csv%s, %d points skipped\n", out_dir.c_str(),
+                    failures ? " (WITH FAILURES)" : "", skipped);
     }
     CUDA_CHECK(cudaFree(table));
     CUDA_CHECK(cudaFree(d_total));
